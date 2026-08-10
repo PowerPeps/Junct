@@ -1,0 +1,9 @@
+Junct.dll
+*.obj
+*.exp
+*.lib
+Setup.exe
+
+build.bat
+/.idea/
+/.build/

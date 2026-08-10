@@ -1,0 +1,34 @@
+name: build-release
+
+on:
+  push:
+    branches: [ master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build DLL
+        run: cl /nologo /LD /MT /EHsc /O2 /W3 /DUNICODE /D_UNICODE Util.cpp Junction.cpp Commands.cpp DllMain.cpp /Fe:Junct.dll /link /DEF:Junct.def
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          & $iscc /Qp installer.iss
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          files: |
+            Setup.exe
+            Junct.dll
