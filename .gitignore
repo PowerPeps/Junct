@@ -1,8 +1,12 @@
 Junct.dll
+Junct32.dll
+Junct.arm64.dll
 *.obj
 *.exp
 *.lib
+*.res
 Setup.exe
+obj/
 
 build.bat
 /.idea/

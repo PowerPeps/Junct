@@ -28,6 +28,8 @@ std::wstring ModuleDir();
 std::wstring GetPublicRoot();
 std::wstring FullPath(const std::wstring& p);
 std::wstring LeafName(const std::wstring& p);
+std::wstring JunctionName(const std::wstring& p);
+std::wstring Combine(const std::wstring& dir, const std::wstring& name);
 std::wstring UniquePath(const std::wstring& dir, const std::wstring& leaf);
 bool PathEqual(const std::wstring& a, const std::wstring& b);
 
@@ -35,3 +37,4 @@ std::wstring ExtendedPath(const std::wstring& p);
 bool GetFileId(const std::wstring& path, FileId& out);
 bool IsDirectory(const std::wstring& path);
 bool IsUnder(const std::wstring& path, const std::wstring& root);
+bool IsLocalVolume(const std::wstring& path);

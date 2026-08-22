@@ -18,9 +18,9 @@ typedef struct _REPARSE_MOUNTPOINT {
 
 static const size_t HEADER_SIZE = FIELD_OFFSET(REPARSE_MOUNTPOINT, PathBuffer);
 
-static bool Fail(const std::wstring& link) {
+static bool Fail(const std::wstring& link, bool created) {
     const DWORD err = GetLastError();
-    RemoveDirectoryW(link.c_str());
+    if (created) RemoveDirectoryW(link.c_str());
     SetLastError(err);
     return false;
 }
@@ -29,18 +29,19 @@ bool MakeJunction(const std::wstring& link, const std::wstring& target) {
     std::wstring t = FullPath(target);
     std::wstring l = ExtendedPath(link);
 
-    if (!CreateDirectoryW(l.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+    const bool created = CreateDirectoryW(l.c_str(), nullptr) != FALSE;
+    if (!created && GetLastError() != ERROR_ALREADY_EXISTS)
         return false;
 
     HANDLE h = CreateFileW(l.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
                            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return Fail(l);
+    if (h == INVALID_HANDLE_VALUE) return Fail(l, created);
 
     std::wstring sub = L"\\??\\" + t;
     if (sub.size() * sizeof(wchar_t) > 0xFF00 || t.size() * sizeof(wchar_t) > 0xFF00) {
         CloseHandle(h);
         SetLastError(ERROR_FILENAME_EXCED_RANGE);
-        return Fail(l);
+        return Fail(l, created);
     }
     USHORT subBytes = (USHORT)(sub.size() * sizeof(wchar_t));
     USHORT prnBytes = (USHORT)(t.size() * sizeof(wchar_t));
@@ -59,7 +60,7 @@ bool MakeJunction(const std::wstring& link, const std::wstring& target) {
 
     DWORD ret = 0;
     BOOL ok = DeviceIoControl(h, FSCTL_SET_REPARSE_POINT, r, (DWORD)buf.size(), nullptr, 0, &ret, nullptr);
-    if (!ok) { const DWORD err = GetLastError(); CloseHandle(h); SetLastError(err); return Fail(l); }
+    if (!ok) { const DWORD err = GetLastError(); CloseHandle(h); SetLastError(err); return Fail(l, created); }
     CloseHandle(h);
     return true;
 }
@@ -104,7 +105,8 @@ void PublicLinkIndex::Build() {
     if (root.empty()) return;
 
     WIN32_FIND_DATAW fd;
-    HANDLE hf = FindFirstFileW(ExtendedPath(root + L"\\*").c_str(), &fd);
+    HANDLE hf = FindFirstFileExW(ExtendedPath(Combine(root, L"*")).c_str(), FindExInfoBasic, &fd,
+                                 FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
     if (hf == INVALID_HANDLE_VALUE) return;
 
     std::vector<BYTE> scratch;
@@ -114,7 +116,7 @@ void PublicLinkIndex::Build() {
         if (fd.dwReserved0 != IO_REPARSE_TAG_MOUNT_POINT) continue;
 
         Entry e;
-        e.link = root + L"\\" + fd.cFileName;
+        e.link = Combine(root, fd.cFileName);
         std::wstring tgt;
         if (!ReadJunctionTarget(e.link, tgt, scratch) || tgt.empty()) continue;
         e.target = FullPath(tgt);

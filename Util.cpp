@@ -51,8 +51,8 @@ std::wstring GetPublicRoot() {
     std::wstring s = DEFAULT_ROOT;
     if (RegGetValueW(HKEY_LOCAL_MACHINE, CFG_KEY, CFG_VALUE, RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS && buf[0])
         s = buf;
-    while (!s.empty() && s.back() == L'\\') s.pop_back();
-    return s;
+    if (s.size() == 2 && s[1] == L':') return s + L'\\';
+    return StripTrailingSlash(s);
 }
 
 std::wstring FullPath(const std::wstring& p) {
@@ -80,13 +80,25 @@ std::wstring ExtendedPath(const std::wstring& p) {
     return L"\\\\?\\" + p;
 }
 
+std::wstring JunctionName(const std::wstring& p) {
+    const std::wstring full = FullPath(p);
+    std::wstring leaf = LeafName(full);
+    if (!leaf.empty()) return leaf;
+    if (full.size() >= 2 && full[1] == L':') return std::wstring(1, full[0]);
+    return leaf;
+}
+
+std::wstring Combine(const std::wstring& dir, const std::wstring& name) {
+    if (dir.empty()) return name;
+    if (dir.back() == L'\\' || dir.back() == L'/') return dir + name;
+    return dir + L'\\' + name;
+}
+
 std::wstring UniquePath(const std::wstring& dir, const std::wstring& leaf) {
-    std::wstring base = dir;
-    if (!base.empty() && base.back() != L'\\') base += L'\\';
-    std::wstring cand = base + leaf;
+    std::wstring cand = Combine(dir, leaf);
     if (GetFileAttributesW(ExtendedPath(cand).c_str()) == INVALID_FILE_ATTRIBUTES) return cand;
     for (int i = 2; i < 1000; ++i) {
-        std::wstring c = base + leaf + L" (" + std::to_wstring(i) + L")";
+        std::wstring c = Combine(dir, leaf + L" (" + std::to_wstring(i) + L")");
         if (GetFileAttributesW(ExtendedPath(c).c_str()) == INVALID_FILE_ATTRIBUTES) return c;
     }
     return cand;
@@ -114,6 +126,28 @@ bool GetFileId(const std::wstring& path, FileId& out) {
 bool IsDirectory(const std::wstring& path) {
     DWORD a = GetFileAttributesW(ExtendedPath(path).c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool IsLocalVolume(const std::wstring& in) {
+    std::wstring p = FullPath(in);
+
+    if (p.compare(0, 4, L"\\\\?\\") == 0 || p.compare(0, 4, L"\\\\.\\") == 0) {
+        if (p.compare(4, 4, L"UNC\\") == 0) return false;
+        p.erase(0, 4);
+    }
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] == L'\\') return false;
+    if (p.size() < 2 || p[1] != L':') return false;
+
+    const wchar_t root[4] = { p[0], L':', L'\\', L'\0' };
+    switch (GetDriveTypeW(root)) {
+        case DRIVE_FIXED:
+        case DRIVE_REMOVABLE:
+        case DRIVE_RAMDISK:
+        case DRIVE_CDROM:
+            return true;
+        default:
+            return false;
+    }
 }
 
 bool IsUnder(const std::wstring& path, const std::wstring& root) {

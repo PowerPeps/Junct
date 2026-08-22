@@ -15,6 +15,7 @@ static const struct {
     Text moreCountPrefix;
     Text moreCountSuffix;
     Text unknownError;
+    Text notLocal;
 } TEXT = {
     { L"Coller la jonction", L"Paste junction" },
     { L"Partager sur public", L"Share to public" },
@@ -23,6 +24,8 @@ static const struct {
     { L"... et ", L"... and " },
     { L" autre(s).", L" more." },
     { L"erreur ", L"error " },
+    { L"Volume non local : une jonction exige un disque de cette machine (ni chemin reseau, ni lecteur mappe).",
+      L"Not a local volume: a junction requires a disk on this machine (no network path, no mapped drive)." },
 };
 
 template <class F>
@@ -34,7 +37,8 @@ static HRESULT Guard(F&& fn) {
 
 struct Failure {
     std::wstring path;
-    DWORD err;
+    DWORD err = 0;
+    const Text* text = nullptr;
 };
 
 static std::wstring ErrorText(DWORD err) {
@@ -57,7 +61,8 @@ static void ReportFailures(HWND owner, const std::wstring& title, const std::vec
     std::wstring body;
     const size_t shown = failed.size() < 12 ? failed.size() : 12;
     for (size_t i = 0; i < shown; ++i)
-        body += failed[i].path + L"\n    " + ErrorText(failed[i].err) + L"\n";
+        body += failed[i].path + L"\n    " +
+                (failed[i].text ? Tr(*failed[i].text) : ErrorText(failed[i].err)) + L"\n";
     if (failed.size() > shown)
         body += Tr(TEXT.moreCountPrefix) + std::to_wstring(failed.size() - shown) + Tr(TEXT.moreCountSuffix);
 
@@ -136,17 +141,26 @@ protected:
         return S_OK;
     }
 
+    static bool IsRealFolder(IShellItem* psi) {
+        SFGAOF f = 0;
+        if (FAILED(psi->GetAttributes(SFGAO_FOLDER | SFGAO_FILESYSTEM | SFGAO_STREAM, &f))) return false;
+        return (f & SFGAO_FOLDER) && (f & SFGAO_FILESYSTEM) && !(f & SFGAO_STREAM);
+    }
+
     void SubjectPaths(IShellItemArray* psia, std::vector<std::wstring>& out) {
         out.clear();
         DWORD count = 0;
         if (psia && SUCCEEDED(psia->GetCount(&count))) {
+            out.reserve(count);
             for (DWORD i = 0; i < count; ++i) {
                 IShellItem* psi = nullptr;
                 if (SUCCEEDED(psia->GetItemAt(i, &psi))) {
-                    LPWSTR path = nullptr;
-                    if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
-                        if (IsDirectory(path)) out.push_back(path);
-                        CoTaskMemFree(path);
+                    if (IsRealFolder(psi)) {
+                        LPWSTR path = nullptr;
+                        if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                            out.push_back(path);
+                            CoTaskMemFree(path);
+                        }
                     }
                     psi->Release();
                 }
@@ -199,16 +213,21 @@ public:
 };
 
 class PasteJunctionCmd : public CommandBase {
+    bool m_probed = false;
+    std::vector<std::wstring> m_sources;
+
 public:
     IFACEMETHODIMP GetTitle(IShellItemArray*, LPWSTR* ppsz) override {
         *ppsz = nullptr;
         return Guard([&] { return SHStrDupW(Tr(TEXT.pasteJunction), ppsz); });
     }
-    IFACEMETHODIMP GetState(IShellItemArray*, BOOL, EXPCMDSTATE* pState) override {
+    IFACEMETHODIMP GetState(IShellItemArray*, BOOL fOkToBeSlow, EXPCMDSTATE* pState) override {
         *pState = ECS_HIDDEN;
         return Guard([&]() -> HRESULT {
-            std::vector<std::wstring> f;
-            *pState = ClipboardFolders(f) ? ECS_ENABLED : ECS_HIDDEN;
+            if (!IsClipboardFormatAvailable(CF_HDROP)) return S_OK;
+            if (!fOkToBeSlow && !m_probed) return E_PENDING;
+            if (!m_probed) { ClipboardFolders(m_sources); m_probed = true; }
+            *pState = m_sources.empty() ? ECS_HIDDEN : ECS_ENABLED;
             return S_OK;
         });
     }
@@ -220,10 +239,17 @@ public:
             SubjectPaths(psia, dests);
 
             std::vector<Failure> failed;
+            for (size_t i = sources.size(); i-- > 0; )
+                if (!IsLocalVolume(sources[i])) {
+                    failed.push_back({ sources[i], 0, &TEXT.notLocal });
+                    sources.erase(sources.begin() + (ptrdiff_t)i);
+                }
+
             for (auto& dest : dests) {
+                if (!IsLocalVolume(dest)) { failed.push_back({ dest, 0, &TEXT.notLocal }); continue; }
                 for (auto& src : sources) {
                     SetLastError(ERROR_SUCCESS);
-                    std::wstring link = UniquePath(dest, LeafName(src));
+                    std::wstring link = UniquePath(dest, JunctionName(src));
                     if (!MakeJunction(link, src)) failed.push_back({ link, GetLastError() });
                 }
                 SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, dest.c_str(), nullptr);
@@ -235,81 +261,100 @@ public:
 };
 
 class PublicToggleCmd : public CommandBase {
-    bool m_computed = false;
+    bool m_subjectsDone = false;
+    bool m_stateDone = false;
     bool m_anyUnshared = false;
     std::vector<std::wstring> m_subjects;
     PublicLinkIndex m_index;
 
-    void Compute(IShellItemArray* psia) {
+    void EnsureSubjects(IShellItemArray* psia) {
+        if (m_subjectsDone) return;
         std::vector<std::wstring> all;
         SubjectPaths(psia, all);
 
-        const std::wstring root = GetPublicRoot();
+        const std::wstring root = FullPath(GetPublicRoot());
         m_subjects.clear();
+        m_subjects.reserve(all.size());
         for (auto& s : all)
-            if (!IsUnder(s, root)) m_subjects.push_back(s);
+            if (!IsUnder(s, root)) m_subjects.push_back(std::move(s));
+        m_subjectsDone = true;
+    }
 
+    void EnsureShareState(IShellItemArray* psia) {
+        EnsureSubjects(psia);
+        if (m_stateDone) return;
         m_index.Build();
         m_anyUnshared = false;
         for (auto& s : m_subjects)
             if (m_index.Find(s).empty()) { m_anyUnshared = true; break; }
-        m_computed = true;
+        m_stateDone = true;
     }
-    void EnsureComputed(IShellItemArray* psia) { if (!m_computed) Compute(psia); }
+
+    void Invalidate() { m_subjectsDone = false; m_stateDone = false; }
 
 public:
-    IFACEMETHODIMP GetState(IShellItemArray* psia, BOOL, EXPCMDSTATE* pState) override {
+    IFACEMETHODIMP GetState(IShellItemArray* psia, BOOL fOkToBeSlow, EXPCMDSTATE* pState) override {
         *pState = ECS_HIDDEN;
         return Guard([&]() -> HRESULT {
-            Compute(psia);
-            *pState = m_subjects.empty() ? ECS_HIDDEN : ECS_ENABLED;
+            EnsureSubjects(psia);
+            if (m_subjects.empty()) return S_OK;
+            if (!fOkToBeSlow && !m_stateDone) return E_PENDING;
+            EnsureShareState(psia);
+            *pState = ECS_ENABLED;
             return S_OK;
         });
     }
     IFACEMETHODIMP GetTitle(IShellItemArray* psia, LPWSTR* ppsz) override {
         *ppsz = nullptr;
         return Guard([&] {
-            EnsureComputed(psia);
+            EnsureShareState(psia);
             return SHStrDupW(m_anyUnshared ? Tr(TEXT.shareToPublic) : Tr(TEXT.removeFromPublic), ppsz);
         });
     }
     IFACEMETHODIMP GetIcon(IShellItemArray* psia, LPWSTR* ppsz) override {
         *ppsz = nullptr;
         return Guard([&]() -> HRESULT {
-            EnsureComputed(psia);
+            EnsureShareState(psia);
             std::wstring dir = ModuleDir();
             if (dir.empty()) return E_FAIL;
-            return SHStrDupW((dir + (m_anyUnshared ? L"\\share.ico,0" : L"\\unshare.ico,0")).c_str(), ppsz);
+            return SHStrDupW(Combine(dir, m_anyUnshared ? L"share.ico,0" : L"unshare.ico,0").c_str(), ppsz);
         });
     }
     IFACEMETHODIMP Invoke(IShellItemArray* psia, IBindCtx*) override {
         return Guard([&]() -> HRESULT {
-            Compute(psia);
+            Invalidate();
+            EnsureShareState(psia);
             if (m_subjects.empty()) return S_OK;
             const std::wstring root = GetPublicRoot();
 
             std::vector<Failure> failed;
+            bool rootReady = false;
             for (auto& s : m_subjects) {
                 const std::wstring link = m_index.Find(s);
                 if (m_anyUnshared) {
-                    if (link.empty()) {
-                        SetLastError(ERROR_SUCCESS);
-                        int rc = SHCreateDirectoryExW(nullptr, root.c_str(), nullptr);
-                        if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && rc != ERROR_FILE_EXISTS) {
-                            failed.push_back({ root, (DWORD)rc });
-                            continue;
+                    if (!link.empty()) continue;
+                    if (!IsLocalVolume(s)) { failed.push_back({ s, 0, &TEXT.notLocal }); continue; }
+                    if (!rootReady) {
+                        if (!IsLocalVolume(root)) { failed.push_back({ root, 0, &TEXT.notLocal }); break; }
+                        if (!IsDirectory(root)) {
+                            int rc = SHCreateDirectoryExW(nullptr, root.c_str(), nullptr);
+                            if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS && rc != ERROR_FILE_EXISTS) {
+                                failed.push_back({ root, (DWORD)rc });
+                                break;
+                            }
                         }
-                        std::wstring dst = UniquePath(root, LeafName(s));
-                        SetLastError(ERROR_SUCCESS);
-                        if (!MakeJunction(dst, s)) failed.push_back({ dst, GetLastError() });
+                        rootReady = true;
                     }
+                    std::wstring dst = UniquePath(root, JunctionName(s));
+                    SetLastError(ERROR_SUCCESS);
+                    if (!MakeJunction(dst, s)) failed.push_back({ dst, GetLastError() });
                 } else if (!link.empty()) {
                     SetLastError(ERROR_SUCCESS);
                     if (!RemoveDirectoryW(ExtendedPath(link).c_str()))
                         failed.push_back({ link, GetLastError() });
                 }
             }
-            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, (root + L"\\").c_str(), nullptr);
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, root.c_str(), nullptr);
             ReportFailures(SiteWindow(), Tr(TEXT.shareToPublic), failed);
             return S_OK;
         });

@@ -1,4 +1,3 @@
-LIBRARY Junct
 EXPORTS
     DllGetClassObject   PRIVATE
     DllCanUnloadNow     PRIVATE

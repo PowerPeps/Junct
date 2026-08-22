@@ -8,15 +8,52 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  dll:
     runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            out: Junct.dll
+          - arch: amd64_x86
+            out: Junct32.dll
+          - arch: amd64_arm64
+            out: Junct.arm64.dll
     steps:
       - uses: actions/checkout@v4
 
       - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
 
-      - name: Build DLL
-        run: cl /nologo /LD /MT /EHsc /O2 /W3 /DUNICODE /D_UNICODE Util.cpp Junction.cpp Commands.cpp DllMain.cpp /Fe:Junct.dll /link /DEF:Junct.def
+      - name: Compile resources
+        run: rc /nologo /fo Junct.res Junct.rc
+
+      - name: Build ${{ matrix.out }}
+        run: cl /nologo /LD /MT /EHsc /O2 /W3 /DUNICODE /D_UNICODE Util.cpp Junction.cpp Commands.cpp DllMain.cpp Junct.res /Fe:${{ matrix.out }} /link /DEF:Junct.def
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.out }}
+          path: ${{ matrix.out }}
+
+  release:
+    needs: dll
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Get-Item Junct.dll).VersionInfo.FileVersion.Trim()
+          if (-not $v) { throw "Junct.dll sans ressource de version" }
+          "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Build installer
         shell: pwsh
@@ -24,11 +61,13 @@ jobs:
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
           & $iscc /Qp installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC a echoue" }
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
+          tag_name: v${{ steps.ver.outputs.version }}
           files: |
             Setup.exe
             Junct.dll
+            Junct32.dll
+            Junct.arm64.dll
